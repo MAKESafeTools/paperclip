@@ -8,3 +8,6 @@ coverage
 data
 tmp
 *.log
+.env
+.env.*
+!.env.example
