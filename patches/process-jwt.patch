@@ -1,0 +1,36 @@
+From 9abfc9265d2ec4008c5d589b5a60d5a57099b94b Mon Sep 17 00:00:00 2001
+From: Scott <scott@makesafetools.com>
+Date: Sun, 17 May 2026 20:52:26 -0700
+Subject: [PATCH] process-adapter: enable supportsLocalAgentJwt
+
+Bring the process adapter to parity with the LLM adapters
+(claude-local, codex-local, etc.) which all declare
+supportsLocalAgentJwt: true. Without this flag, heartbeat.ts
+skips minting a per-run JWT, so PAPERCLIP_API_KEY never gets
+injected into the spawned process and the script has no way
+to authenticate back to paperclip's API.
+
+With the flag set, every process-agent run receives a fresh
+short-lived JWT as PAPERCLIP_API_KEY, accepted by the existing
+verifyLocalAgentJwt middleware - no per-agent CLI mint needed.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ server/src/adapters/process/index.ts | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/server/src/adapters/process/index.ts b/server/src/adapters/process/index.ts
+index 650b6a7b..ac0749a0 100644
+--- a/server/src/adapters/process/index.ts
++++ b/server/src/adapters/process/index.ts
+@@ -4,6 +4,7 @@ import { testEnvironment } from "./test.js";
+ 
+ export const processAdapter: ServerAdapterModule = {
+   type: "process",
++  supportsLocalAgentJwt: true,
+   execute,
+   testEnvironment,
+   models: [],
+-- 
+2.43.0
+
