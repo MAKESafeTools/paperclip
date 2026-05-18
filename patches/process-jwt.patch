@@ -1,7 +1,7 @@
 From 9abfc9265d2ec4008c5d589b5a60d5a57099b94b Mon Sep 17 00:00:00 2001
 From: Scott <scott@makesafetools.com>
 Date: Sun, 17 May 2026 20:52:26 -0700
-Subject: [PATCH] process-adapter: enable supportsLocalAgentJwt
+Subject: [PATCH 1/2] process-adapter: enable supportsLocalAgentJwt
 
 Bring the process adapter to parity with the LLM adapters
 (claude-local, codex-local, etc.) which all declare
@@ -31,6 +31,54 @@ index 650b6a7b..ac0749a0 100644
    execute,
    testEnvironment,
    models: [],
+-- 
+2.43.0
+
+
+From c297a7b3ff786cc7a2ad0c0687e9b4cef515894b Mon Sep 17 00:00:00 2001
+From: Scott <scott@makesafetools.com>
+Date: Sun, 17 May 2026 21:14:51 -0700
+Subject: [PATCH 2/2] process-adapter: inject PAPERCLIP_API_KEY + RUN_ID into
+ spawned env
+
+The supportsLocalAgentJwt: true flag mints a per-run JWT and sets
+it on ctx.authToken, but the process adapter's execute.ts never
+read it. Every LLM adapter has its own ~5-line block that pulls
+authToken from ctx and injects it as PAPERCLIP_API_KEY into the
+spawned env (see claude-local, codex-local, gemini-local, etc.);
+the process adapter was missing that.
+
+Also inject PAPERCLIP_RUN_ID, consistent with the hermes wrapper
+and the other adapters. The user's adapterConfig.env still wins
+because envConfig is merged last.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ server/src/adapters/process/execute.ts | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/server/src/adapters/process/execute.ts b/server/src/adapters/process/execute.ts
+index ff2bf82e..fc664ecf 100644
+--- a/server/src/adapters/process/execute.ts
++++ b/server/src/adapters/process/execute.ts
+@@ -12,7 +12,7 @@ import {
+ } from "../utils.js";
+ 
+ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+-  const { runId, agent, config, onLog, onMeta } = ctx;
++  const { runId, agent, config, onLog, onMeta, authToken } = ctx;
+   const command = asString(config.command, "");
+   if (!command) throw new Error("Process adapter missing command");
+ 
+@@ -20,6 +20,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+   const cwd = asString(config.cwd, process.cwd());
+   const envConfig = parseObject(config.env);
+   const env: Record<string, string> = { ...buildPaperclipEnv(agent) };
++  env.PAPERCLIP_RUN_ID = runId;
++  if (authToken) env.PAPERCLIP_API_KEY = authToken;
+   for (const [k, v] of Object.entries(envConfig)) {
+     if (typeof v === "string") env[k] = v;
+   }
 -- 
 2.43.0
 
