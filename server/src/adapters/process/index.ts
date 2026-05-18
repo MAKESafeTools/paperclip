@@ -4,6 +4,7 @@ import { testEnvironment } from "./test.js";
 
 export const processAdapter: ServerAdapterModule = {
   type: "process",
+  supportsLocalAgentJwt: true,
   execute,
   testEnvironment,
   models: [],
