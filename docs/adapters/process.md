@@ -48,3 +48,7 @@ An agent that runs a Python script:
 ```
 
 The script can use the injected environment variables to authenticate with the Paperclip API and perform work.
+
+## Calling MCP tools
+
+A process agent can call self-hosted MCP servers directly over HTTP without any LLM in the loop. See [Calling MCP Tools from a Process Agent](./process-calling-mcp.md) for the env convention and a copy-pasteable `mcp_call` bash helper.

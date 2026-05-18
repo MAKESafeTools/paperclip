@@ -99,6 +99,7 @@
               "adapters/claude-local",
               "adapters/codex-local",
               "adapters/process",
+              "adapters/process-calling-mcp",
               "adapters/http",
               "adapters/external-adapters",
               "adapters/adapter-ui-parser",
