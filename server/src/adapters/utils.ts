@@ -34,6 +34,8 @@ export const ensurePathInEnv = serverUtils.ensurePathInEnv;
 export const ensureAbsoluteDirectory = serverUtils.ensureAbsoluteDirectory;
 export const ensureCommandResolvable = serverUtils.ensureCommandResolvable;
 export const resolveCommandForLogs = serverUtils.resolveCommandForLogs;
+export const stringifyPaperclipWakePayload = serverUtils.stringifyPaperclipWakePayload;
+export const readPaperclipIssueWorkModeFromContext = serverUtils.readPaperclipIssueWorkModeFromContext;
 
 export function buildInvocationEnvForLogs(
   env: Record<string, string>,
