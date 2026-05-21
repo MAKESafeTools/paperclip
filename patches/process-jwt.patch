@@ -1,7 +1,7 @@
 From 9abfc9265d2ec4008c5d589b5a60d5a57099b94b Mon Sep 17 00:00:00 2001
 From: Scott <scott@makesafetools.com>
 Date: Sun, 17 May 2026 20:52:26 -0700
-Subject: [PATCH 1/2] process-adapter: enable supportsLocalAgentJwt
+Subject: [PATCH 1/3] process-adapter: enable supportsLocalAgentJwt
 
 Bring the process adapter to parity with the LLM adapters
 (claude-local, codex-local, etc.) which all declare
@@ -38,7 +38,7 @@ index 650b6a7b..ac0749a0 100644
 From c297a7b3ff786cc7a2ad0c0687e9b4cef515894b Mon Sep 17 00:00:00 2001
 From: Scott <scott@makesafetools.com>
 Date: Sun, 17 May 2026 21:14:51 -0700
-Subject: [PATCH 2/2] process-adapter: inject PAPERCLIP_API_KEY + RUN_ID into
+Subject: [PATCH 2/3] process-adapter: inject PAPERCLIP_API_KEY + RUN_ID into
  spawned env
 
 The supportsLocalAgentJwt: true flag mints a per-run JWT and sets
@@ -79,6 +79,122 @@ index ff2bf82e..fc664ecf 100644
    for (const [k, v] of Object.entries(envConfig)) {
      if (typeof v === "string") env[k] = v;
    }
+-- 
+2.43.0
+
+
+From 6ede75ca5f0b30b1703ed7ccded83ae36a5bcf2d Mon Sep 17 00:00:00 2001
+From: Scott <scott@makesafetools.com>
+Date: Wed, 20 May 2026 18:02:17 -0700
+Subject: [PATCH 3/3] process-adapter: inject wake-context env vars
+ (PAPERCLIP_TASK_ID, etc.)
+
+Bring the process adapter to parity with the LLM adapters for
+wake-context env injection. Every LLM adapter (claude-local,
+codex-local, gemini-local, etc.) sets a richer set of env vars
+from ctx.context so the run can know which task it was woken
+for, why, and what triggered the wake. Process adapter only had
+PAPERCLIP_API_KEY + PAPERCLIP_RUN_ID until now, leaving
+run.sh-style agents to make an inbox-lite roundtrip just to
+re-discover their assigned task.
+
+New env vars (only set when source is non-empty, so agent's own
+adapterConfig.env overrides cleanly):
+
+- PAPERCLIP_TASK_ID       (context.taskId ?? context.issueId)
+- PAPERCLIP_WAKE_REASON
+- PAPERCLIP_WAKE_COMMENT_ID
+- PAPERCLIP_APPROVAL_ID / PAPERCLIP_APPROVAL_STATUS
+- PAPERCLIP_LINKED_ISSUE_IDS (CSV)
+- PAPERCLIP_ISSUE_WORK_MODE
+- PAPERCLIP_WAKE_PAYLOAD_JSON
+
+Mirrors packages/adapters/claude-local/src/server/execute.ts:185-234
+exactly; reuses readPaperclipIssueWorkModeFromContext and
+stringifyPaperclipWakePayload from adapter-utils.
+
+Workspace env (applyPaperclipWorkspaceEnv) is intentionally out of
+scope - LLM adapters pre-shape workspace state in ways that don't
+apply to a generic shell command.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ server/src/adapters/process/execute.ts | 38 +++++++++++++++++++++++++-
+ server/src/adapters/utils.ts           |  2 ++
+ 2 files changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/server/src/adapters/process/execute.ts b/server/src/adapters/process/execute.ts
+index fc664ecf..3c99705e 100644
+--- a/server/src/adapters/process/execute.ts
++++ b/server/src/adapters/process/execute.ts
+@@ -9,10 +9,12 @@ import {
+   ensurePathInEnv,
+   resolveCommandForLogs,
+   runChildProcess,
++  readPaperclipIssueWorkModeFromContext,
++  stringifyPaperclipWakePayload,
+ } from "../utils.js";
+ 
+ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+-  const { runId, agent, config, onLog, onMeta, authToken } = ctx;
++  const { runId, agent, config, context, onLog, onMeta, authToken } = ctx;
+   const command = asString(config.command, "");
+   if (!command) throw new Error("Process adapter missing command");
+ 
+@@ -22,6 +24,40 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
+   const env: Record<string, string> = { ...buildPaperclipEnv(agent) };
+   env.PAPERCLIP_RUN_ID = runId;
+   if (authToken) env.PAPERCLIP_API_KEY = authToken;
++
++  const ctxRecord = (context ?? {}) as Record<string, unknown>;
++  const readTrimmedString = (value: unknown): string | null =>
++    typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
++
++  const wakeTaskId = readTrimmedString(ctxRecord.taskId) ?? readTrimmedString(ctxRecord.issueId);
++  if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
++
++  const wakeReason = readTrimmedString(ctxRecord.wakeReason);
++  if (wakeReason) env.PAPERCLIP_WAKE_REASON = wakeReason;
++
++  const wakeCommentId =
++    readTrimmedString(ctxRecord.wakeCommentId) ?? readTrimmedString(ctxRecord.commentId);
++  if (wakeCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = wakeCommentId;
++
++  const approvalId = readTrimmedString(ctxRecord.approvalId);
++  if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
++
++  const approvalStatus = readTrimmedString(ctxRecord.approvalStatus);
++  if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
++
++  const linkedIssueIds = Array.isArray(ctxRecord.issueIds)
++    ? ctxRecord.issueIds.filter(
++        (value): value is string => typeof value === "string" && value.trim().length > 0,
++      )
++    : [];
++  if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
++
++  const issueWorkMode = readPaperclipIssueWorkModeFromContext(ctxRecord);
++  if (issueWorkMode) env.PAPERCLIP_ISSUE_WORK_MODE = issueWorkMode;
++
++  const wakePayloadJson = stringifyPaperclipWakePayload(ctxRecord.paperclipWake);
++  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
++
+   for (const [k, v] of Object.entries(envConfig)) {
+     if (typeof v === "string") env[k] = v;
+   }
+diff --git a/server/src/adapters/utils.ts b/server/src/adapters/utils.ts
+index a2682f23..6a2ec3a8 100644
+--- a/server/src/adapters/utils.ts
++++ b/server/src/adapters/utils.ts
+@@ -34,6 +34,8 @@ export const ensurePathInEnv = serverUtils.ensurePathInEnv;
+ export const ensureAbsoluteDirectory = serverUtils.ensureAbsoluteDirectory;
+ export const ensureCommandResolvable = serverUtils.ensureCommandResolvable;
+ export const resolveCommandForLogs = serverUtils.resolveCommandForLogs;
++export const stringifyPaperclipWakePayload = serverUtils.stringifyPaperclipWakePayload;
++export const readPaperclipIssueWorkModeFromContext = serverUtils.readPaperclipIssueWorkModeFromContext;
+ 
+ export function buildInvocationEnvForLogs(
+   env: Record<string, string>,
 -- 
 2.43.0
 
