@@ -1,0 +1,41 @@
+services:
+  paperclip:
+    build: .
+    container_name: paperclip
+    ports:
+      - "3100:3100"
+    restart: unless-stopped
+    networks:
+      - paperclip-net
+    env_file:
+      - .env
+    environment:
+      - ANTHROPIC_BASE_URL=http://cache-proxy:8000
+    depends_on:
+      cache-proxy:
+        condition: service_healthy
+    volumes:
+      - paperclip-data:/paperclip
+      - /home/scott/.paperclip/mcp-configs:/home/scott/.paperclip/mcp-configs:ro
+
+  cache-proxy:
+    build: ./cache-proxy
+    container_name: paperclip-cache-proxy
+    restart: unless-stopped
+    networks:
+      - paperclip-net
+    environment:
+      - TARGET_URL=https://api.anthropic.com
+      - CACHE_TTL=1h
+      - INJECT_CACHE_CONTROL=true
+      - INJECT_SYSTEM=true
+      - INJECT_TOOLS=true
+      - MIN_SYSTEM_TOKENS=1024
+      - LOG_LEVEL=INFO
+
+networks:
+  paperclip-net:
+    driver: bridge
+
+volumes:
+  paperclip-data:
