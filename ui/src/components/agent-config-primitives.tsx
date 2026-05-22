@@ -60,6 +60,7 @@ export const help: Record<string, string> = {
   maxTurnContinuationMaxAttempts: "Maximum automatic continuations after one max-turn stop. This is separate from max turns per run.",
   maxTurnContinuationDelaySec: "Seconds to wait before starting each max-turn continuation.",
   budgetMonthlyCents: "Monthly spending limit in cents. 0 means no limit.",
+  disabledTools: "Tool names or wildcard patterns to deny for this agent (e.g. WebSearch, mcp__claude_ai_Adobe_*). One entry per line. Passed to Claude Code as --disallowedTools, which both hides the tool from the model and blocks invocation. Use this to trim prompt tokens by excluding MCP servers the agent doesn't need.",
 };
 
 import { getAdapterLabels } from "../adapters/adapter-display-registry";

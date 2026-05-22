@@ -377,6 +377,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const chrome = asBoolean(config.chrome, false);
   const maxTurns = asNumber(config.maxTurnsPerRun, 0);
   const dangerouslySkipPermissions = asBoolean(config.dangerouslySkipPermissions, true);
+  const disabledTools = asStringArray(config.disabledTools);
   const configEnv = parseObject(config.env);
   const workspaceContext = parseObject(context.paperclipWorkspace);
   const workspaceCwd = asString(workspaceContext.cwd, "");
@@ -682,6 +683,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       dangerouslySkipPermissions,
       targetIsSandbox: executionTargetIsSandbox,
     }));
+    if (disabledTools.length > 0) {
+      args.push("--disallowedTools", disabledTools.join(" "));
+    }
     if (chrome) args.push("--chrome");
     // For Bedrock: only pass --model when the ID is a Bedrock-native identifier
     // (e.g. "us.anthropic.*" or ARN). Anthropic-style IDs like "claude-opus-4-6" are invalid

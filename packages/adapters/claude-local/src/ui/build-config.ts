@@ -7,6 +7,13 @@ function parseCommaArgs(value: string): string[] {
     .filter(Boolean);
 }
 
+function parseDisabledTools(value: string): string[] {
+  return value
+    .split(/[\n,]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 function parseEnvVars(text: string): Record<string, string> {
   const env: Record<string, string> = {};
   for (const line of text.split(/\r?\n/)) {
@@ -95,5 +102,9 @@ export function buildClaudeLocalConfig(v: CreateConfigValues): Record<string, un
   }
   if (v.command) ac.command = v.command;
   if (v.extraArgs) ac.extraArgs = parseCommaArgs(v.extraArgs);
+  if (v.disabledTools) {
+    const parsed = parseDisabledTools(v.disabledTools);
+    if (parsed.length > 0) ac.disabledTools = parsed;
+  }
   return ac;
 }

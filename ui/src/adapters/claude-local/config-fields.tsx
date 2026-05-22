@@ -4,10 +4,20 @@ import {
   ToggleField,
   DraftInput,
   DraftNumberInput,
+  DraftTextarea,
   help,
 } from "../../components/agent-config-primitives";
 import { ChoosePathButton } from "../../components/PathInstructionsModal";
 import { LocalWorkspaceRuntimeFields } from "../local-workspace-runtime-fields";
+
+const disabledToolsPlaceholder = "WebSearch\nmcp__claude_ai_Adobe_for_creativity__*";
+
+function parseDisabledToolsText(text: string): string[] {
+  return text
+    .split(/[\n,]+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
 
 const inputClass =
   "w-full rounded-md border border-border px-2.5 py-1.5 bg-transparent outline-none text-sm font-mono placeholder:text-muted-foreground/40";
@@ -132,6 +142,35 @@ export function ClaudeLocalAdvancedFields({
             className={inputClass}
           />
         )}
+      </Field>
+      <Field label="Disabled tools" hint={help.disabledTools}>
+        <DraftTextarea
+          value={
+            isCreate
+              ? values!.disabledTools ?? ""
+              : (eff(
+                  "adapterConfig",
+                  "disabledTools",
+                  Array.isArray(config.disabledTools)
+                    ? (config.disabledTools as string[])
+                    : [],
+                ) as string[]).join("\n")
+          }
+          onCommit={(v) => {
+            const parsed = parseDisabledToolsText(v);
+            if (isCreate) {
+              set!({ disabledTools: v });
+            } else {
+              mark(
+                "adapterConfig",
+                "disabledTools",
+                parsed.length > 0 ? parsed : undefined,
+              );
+            }
+          }}
+          placeholder={disabledToolsPlaceholder}
+          minRows={3}
+        />
       </Field>
     </>
   );

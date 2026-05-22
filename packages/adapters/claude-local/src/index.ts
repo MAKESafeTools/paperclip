@@ -42,6 +42,7 @@ Core fields:
 - dangerouslySkipPermissions (boolean, optional, default true): pass --dangerously-skip-permissions to claude; defaults to true because Paperclip runs Claude in headless --print mode where interactive permission prompts cannot be answered
 - command (string, optional): defaults to "claude"
 - extraArgs (string[], optional): additional CLI args
+- disabledTools (string[], optional): tool names or wildcard patterns passed to claude as --disallowedTools to hide tools from this agent (e.g. ["WebSearch", "mcp__claude_ai_Adobe_*"]). Use to trim the tool count loaded into the model context per agent.
 - env (object, optional): KEY=VALUE environment variables
 - workspaceStrategy (object, optional): execution workspace strategy; currently supports { type: "git_worktree", baseRef?, branchTemplate?, worktreeParentDir? }
 - workspaceRuntime (object, optional): reserved for workspace runtime metadata; workspace runtime services are manually controlled from the workspace UI and are not auto-started by heartbeats
