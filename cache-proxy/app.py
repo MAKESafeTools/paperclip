@@ -13,12 +13,15 @@ import copy
 import json
 import logging
 import os
+import time
+import uuid
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 TARGET_URL = os.environ.get("TARGET_URL", "https://api.anthropic.com").rstrip("/")
 CACHE_TTL = os.environ.get("CACHE_TTL", "1h")
@@ -28,6 +31,9 @@ INJECT_TOOLS = os.environ.get("INJECT_TOOLS", "true").lower() == "true"
 MIN_SYSTEM_TOKENS = int(os.environ.get("MIN_SYSTEM_TOKENS", "1024"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 BETA_FLAG = "extended-cache-ttl-2025-04-11"
+TRAFFIC_BUFFER_SIZE = int(os.environ.get("TRAFFIC_BUFFER_SIZE", "500"))
+TRAFFIC_MAX_BODY_BYTES = int(os.environ.get("TRAFFIC_MAX_BODY_BYTES", "2000000"))
+REDACTED_HEADERS = {"authorization", "x-api-key", "anthropic-auth-token", "cookie", "proxy-authorization"}
 HOP_BY_HOP = {"host", "content-length", "connection", "transfer-encoding"}
 # We negotiate compression with upstream ourselves (identity) so the body bytes we
 # forward to the client are never mislabeled. See _filter_headers().
@@ -291,6 +297,310 @@ def _extract_usage(obj: Any) -> dict[str, Any] | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Traffic capture
+# ---------------------------------------------------------------------------
+
+_exchanges: deque = deque(maxlen=TRAFFIC_BUFFER_SIZE)
+
+
+def _redact(headers: dict[str, str]) -> dict[str, str]:
+    return {k: ("***redacted***" if k.lower() in REDACTED_HEADERS else v) for k, v in headers.items()}
+
+
+def _truncate_text(data: bytes | str, limit: int = TRAFFIC_MAX_BODY_BYTES) -> tuple[str, bool]:
+    if isinstance(data, bytes):
+        text = data.decode("utf-8", errors="replace")
+    else:
+        text = data
+    if len(text) > limit:
+        return text[:limit] + f"\n...[truncated {len(text) - limit} bytes]", True
+    return text, False
+
+
+def _try_parse_json(data: bytes | str) -> Any:
+    if isinstance(data, bytes):
+        try:
+            data = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    try:
+        return json.loads(data)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _reconstruct_assistant_text(sse_text: str) -> str:
+    """Walk SSE events and concatenate text deltas so the UI can show a
+    readable assistant reply instead of just raw event-stream chunks."""
+    parts: list[str] = []
+    for line in sse_text.split("\n"):
+        line = line.rstrip("\r")
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            evt = json.loads(payload)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if evt.get("type") == "content_block_delta":
+            delta = evt.get("delta") or {}
+            t = delta.get("text") or delta.get("partial_json") or ""
+            if isinstance(t, str) and t:
+                parts.append(t)
+    return "".join(parts)
+
+
+class Recorder:
+    """Captures one request/response exchange and appends it to the ring buffer."""
+
+    def __init__(self, *, method: str, path: str, req_headers: dict[str, str],
+                 req_body: bytes, model: Any, streaming: bool) -> None:
+        self.id = uuid.uuid4().hex[:12]
+        self.ts = datetime.now(timezone.utc).isoformat()
+        self.t0 = time.perf_counter()
+        self.method = method
+        self.path = path
+        self.req_headers = _redact(req_headers)
+        body_text, truncated = _truncate_text(req_body)
+        self.req_body_text = body_text
+        self.req_body_truncated = truncated
+        self.req_body_json = _try_parse_json(req_body)
+        self.model = model
+        self.streaming = streaming
+
+    def finish(self, *, status: int | None, resp_headers: dict[str, str] | None,
+               resp_body: bytes | None = None, sse_text: str | None = None,
+               usage: dict[str, Any] | None = None, error: str | None = None) -> None:
+        duration_ms = int((time.perf_counter() - self.t0) * 1000)
+        resp_body_text = ""
+        resp_body_truncated = False
+        resp_body_json: Any = None
+        assistant_text = ""
+        if sse_text is not None:
+            resp_body_text, resp_body_truncated = _truncate_text(sse_text)
+            assistant_text = _reconstruct_assistant_text(sse_text)
+        elif resp_body is not None:
+            resp_body_text, resp_body_truncated = _truncate_text(resp_body)
+            resp_body_json = _try_parse_json(resp_body)
+        record = {
+            "id": self.id,
+            "ts": self.ts,
+            "method": self.method,
+            "path": self.path,
+            "model": self.model,
+            "streaming": self.streaming,
+            "status": status,
+            "duration_ms": duration_ms,
+            "usage": usage,
+            "error": error,
+            "request": {
+                "headers": self.req_headers,
+                "body_json": self.req_body_json,
+                "body_text": self.req_body_text if self.req_body_json is None else None,
+                "truncated": self.req_body_truncated,
+            },
+            "response": {
+                "headers": dict(resp_headers or {}),
+                "body_json": resp_body_json,
+                "body_text": resp_body_text if resp_body_json is None else None,
+                "assistant_text": assistant_text or None,
+                "truncated": resp_body_truncated,
+            },
+        }
+        _exchanges.appendleft(record)
+
+
+TRAFFIC_HTML = """<!doctype html>
+<html><head><meta charset=\"utf-8\"><title>cache-proxy traffic</title>
+<style>
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; background: #0f1115; color: #ddd; }
+.bar { padding: 8px 12px; background: #181a20; border-bottom: 1px solid #2a2d36; display: flex; gap: 16px; align-items: center; position: sticky; top: 0; z-index: 10; }
+.bar h1 { font-size: 13px; margin: 0; font-weight: 600; letter-spacing: 0.5px; }
+.bar .meta { color: #888; font-size: 12px; }
+.bar label { color: #aaa; font-size: 12px; cursor: pointer; user-select: none; }
+.bar input[type=text] { background: #0a0c11; border: 1px solid #2a2d36; color: #ddd; padding: 4px 8px; border-radius: 3px; font: inherit; font-size: 12px; width: 180px; }
+.list { padding: 0; }
+.exch { border-bottom: 1px solid #1d1f26; }
+.exch > summary { padding: 6px 12px; cursor: pointer; display: grid; grid-template-columns: 70px 50px 110px 1fr 240px 70px; gap: 12px; align-items: center; font-size: 12px; list-style: none; }
+.exch > summary::-webkit-details-marker { display: none; }
+.exch > summary:hover { background: #161821; }
+.exch[open] > summary { background: #14161e; }
+.col-time { color: #888; }
+.col-status.s-2 { color: #4ade80; }
+.col-status.s-4, .col-status.s-5 { color: #f87171; }
+.col-method { color: #60a5fa; }
+.tag { font-size: 10px; padding: 1px 5px; border-radius: 2px; background: #2a2d36; color: #bbb; margin-left: 4px; }
+.col-path { color: #ddd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.col-path .model { color: #c4b5fd; margin-left: 8px; font-size: 11px; }
+.col-usage { color: #888; font-size: 11px; text-align: right; }
+.col-duration { color: #888; text-align: right; }
+.detail { padding: 12px 20px 16px; background: #0c0e14; border-top: 1px solid #1d1f26; }
+.detail h3 { margin: 14px 0 4px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px; color: #999; font-weight: 600; }
+.detail h3:first-child { margin-top: 0; }
+.detail pre { background: #06080c; padding: 10px 12px; border-radius: 4px; overflow: auto; max-height: 500px; font-size: 11px; margin: 0; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
+.empty { padding: 40px; text-align: center; color: #666; font-size: 13px; }
+</style>
+</head><body>
+<div class=\"bar\">
+  <h1>CACHE-PROXY TRAFFIC</h1>
+  <span class=\"meta\" id=\"meta\">loading…</span>
+  <input type=\"text\" id=\"filter\" placeholder=\"filter (model, path, status)…\">
+  <label><input type=\"checkbox\" id=\"live\" checked> live</label>
+  <label><input type=\"checkbox\" id=\"autoexpand\"> auto-expand newest</label>
+</div>
+<div class=\"list\" id=\"list\"></div>
+<script>
+const $list = document.getElementById('list');
+const $meta = document.getElementById('meta');
+const $live = document.getElementById('live');
+const $filter = document.getElementById('filter');
+const $autoexpand = document.getElementById('autoexpand');
+const expanded = new Set();
+let knownIds = new Set();
+
+const fmt = n => (n == null ? '·' : Number(n).toLocaleString());
+const escapeHtml = s => String(s == null ? '' : s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const statusCls = s => s ? 's-' + String(s)[0] : '';
+
+function matchesFilter(r, q) {
+  if (!q) return true;
+  q = q.toLowerCase();
+  return [r.path, r.model, r.status, r.method].some(v => String(v ?? '').toLowerCase().includes(q));
+}
+
+async function tick() {
+  if (!$live.checked) return;
+  try {
+    const r = await fetch('/traffic/exchanges');
+    const data = await r.json();
+    $meta.textContent = `${data.count} captured · buffer ${data.buffer_size}`;
+    render(data.exchanges);
+  } catch (e) {
+    $meta.textContent = 'error: ' + e;
+  }
+}
+
+function render(rows) {
+  const q = $filter.value.trim();
+  const filtered = rows.filter(r => matchesFilter(r, q));
+  const newIds = new Set(filtered.map(r => r.id));
+  const firstNew = filtered.find(r => !knownIds.has(r.id));
+  $list.innerHTML = '';
+  if (filtered.length === 0) {
+    $list.innerHTML = '<div class=\"empty\">no exchanges captured yet · fire a request through the proxy</div>';
+    knownIds = newIds;
+    return;
+  }
+  for (const r of filtered) {
+    const det = document.createElement('details');
+    det.className = 'exch';
+    det.dataset.id = r.id;
+    if (expanded.has(r.id)) det.open = true;
+    det.addEventListener('toggle', () => {
+      if (det.open) {
+        expanded.add(r.id);
+        if (!det.dataset.loaded) loadDetail(r.id, det);
+      } else {
+        expanded.delete(r.id);
+      }
+    });
+    const time = (r.ts || '').replace('T', ' ').slice(11, 19);
+    const usage = r.usage
+      ? `in ${fmt(r.usage.in)} · out ${fmt(r.usage.out)} · cR ${fmt(r.usage.cache_read)} · cC ${fmt(r.usage.cache_create)}`
+      : '·';
+    det.innerHTML = `
+      <summary>
+        <span class=\"col-time\">${time}</span>
+        <span class=\"col-status ${statusCls(r.status)}\">${r.status ?? '…'}</span>
+        <span class=\"col-method\">${escapeHtml(r.method)}${r.streaming ? '<span class=\"tag\">SSE</span>' : ''}</span>
+        <span class=\"col-path\">${escapeHtml(r.path)}<span class=\"model\">${escapeHtml(r.model ?? '')}</span></span>
+        <span class=\"col-usage\">${usage}</span>
+        <span class=\"col-duration\">${r.duration_ms ?? '·'} ms</span>
+      </summary>
+      <div class=\"detail\">loading…</div>
+    `;
+    $list.appendChild(det);
+  }
+  if ($autoexpand.checked && firstNew && knownIds.size > 0) {
+    const node = $list.querySelector(`[data-id=\"${firstNew.id}\"]`);
+    if (node && !node.open) node.open = true;
+  }
+  knownIds = newIds;
+}
+
+async function loadDetail(id, det) {
+  const slot = det.querySelector('.detail');
+  try {
+    const r = await fetch('/traffic/exchanges/' + id);
+    if (!r.ok) { slot.textContent = 'not found'; return; }
+    const e = await r.json();
+    const reqBody = e.request.body_json != null
+      ? JSON.stringify(e.request.body_json, null, 2)
+      : (e.request.body_text || '');
+    const respBody = e.response.body_json != null
+      ? JSON.stringify(e.response.body_json, null, 2)
+      : (e.response.body_text || '');
+    const parts = [];
+    if (e.response.assistant_text) {
+      parts.push(`<h3>Assistant reply (reconstructed)</h3><pre>${escapeHtml(e.response.assistant_text)}</pre>`);
+    }
+    parts.push(`<h3>Request headers</h3><pre>${escapeHtml(JSON.stringify(e.request.headers, null, 2))}</pre>`);
+    parts.push(`<h3>Request body${e.request.truncated ? ' (truncated)' : ''}</h3><pre>${escapeHtml(reqBody)}</pre>`);
+    parts.push(`<h3>Response headers</h3><pre>${escapeHtml(JSON.stringify(e.response.headers, null, 2))}</pre>`);
+    parts.push(`<h3>Response body${e.response.truncated ? ' (truncated)' : ''}</h3><pre>${escapeHtml(respBody)}</pre>`);
+    if (e.error) parts.push(`<h3>Error</h3><pre>${escapeHtml(e.error)}</pre>`);
+    slot.innerHTML = parts.join('');
+    det.dataset.loaded = '1';
+  } catch (err) {
+    slot.textContent = 'error: ' + err;
+  }
+}
+
+$filter.addEventListener('input', tick);
+tick();
+setInterval(tick, 2000);
+</script>
+</body></html>
+"""
+
+
+@app.get("/traffic", include_in_schema=False)
+async def traffic_ui() -> Response:
+    return HTMLResponse(TRAFFIC_HTML)
+
+
+@app.get("/traffic/exchanges", include_in_schema=False)
+async def traffic_list() -> JSONResponse:
+    summaries = [
+        {
+            "id": e["id"],
+            "ts": e["ts"],
+            "method": e["method"],
+            "path": e["path"],
+            "model": e["model"],
+            "streaming": e["streaming"],
+            "status": e["status"],
+            "duration_ms": e["duration_ms"],
+            "usage": e["usage"],
+        }
+        for e in _exchanges
+    ]
+    return JSONResponse({"count": len(summaries), "buffer_size": TRAFFIC_BUFFER_SIZE, "exchanges": summaries})
+
+
+@app.get("/traffic/exchanges/{ex_id}", include_in_schema=False)
+async def traffic_detail(ex_id: str) -> JSONResponse:
+    for e in _exchanges:
+        if e["id"] == ex_id:
+            return JSONResponse(e)
+    return JSONResponse({"error": "not found"}, status_code=404)
+
+
 @app.post("/v1/messages")
 async def messages(request: Request) -> Response:
     raw = await request.body()
@@ -348,18 +658,26 @@ async def messages(request: Request) -> Response:
         had_cc, INJECT_CACHE_CONTROL, sys_inj, tools_inj,
     )
 
+    recorder = Recorder(
+        method=request.method, path=request.url.path,
+        req_headers=dict(request.headers), req_body=out_bytes,
+        model=model, streaming=streaming,
+    )
     assert _client is not None
     if streaming:
-        return await _stream_forward(url, headers, out_bytes, base_log)
-    return await _buffered_forward(url, headers, out_bytes, base_log)
+        return await _stream_forward(url, headers, out_bytes, base_log, recorder)
+    return await _buffered_forward(url, headers, out_bytes, base_log, recorder)
 
 
-async def _buffered_forward(url: str, headers: dict[str, str], body: bytes, base_log: str) -> Response:
+async def _buffered_forward(url: str, headers: dict[str, str], body: bytes, base_log: str,
+                            recorder: Recorder | None = None) -> Response:
     assert _client is not None
     try:
         resp = await _client.post(url, headers=headers, content=body)
     except httpx.HTTPError as e:
         log.error("%s upstream-error=%s", base_log, e)
+        if recorder:
+            recorder.finish(status=502, resp_headers=None, error=str(e))
         return JSONResponse({"error": {"type": "proxy_error", "message": str(e)}}, status_code=502)
 
     usage = None
@@ -370,11 +688,15 @@ async def _buffered_forward(url: str, headers: dict[str, str], body: bytes, base
     log.info("%s status=%d usage=%s", base_log, resp.status_code, usage)
 
     resp_headers = _strip_response_encoding(_filter_headers(dict(resp.headers)))
+    if recorder:
+        recorder.finish(status=resp.status_code, resp_headers=resp_headers,
+                        resp_body=resp.content, usage=usage)
     return Response(content=resp.content, status_code=resp.status_code, headers=resp_headers,
                     media_type=resp.headers.get("content-type"))
 
 
-async def _stream_forward(url: str, headers: dict[str, str], body: bytes, base_log: str) -> Response:
+async def _stream_forward(url: str, headers: dict[str, str], body: bytes, base_log: str,
+                          recorder: Recorder | None = None) -> Response:
     assert _client is not None
     # Open the upstream stream, peek the status. If it's non-2xx, drain and return
     # a regular Response so the CLI sees the correct HTTP code. Only stream when 2xx.
@@ -385,6 +707,8 @@ async def _stream_forward(url: str, headers: dict[str, str], body: bytes, base_l
         upstream = await cm.__aenter__()
     except httpx.HTTPError as e:
         log.error("%s upstream-connect-error=%s", base_log, e)
+        if recorder:
+            recorder.finish(status=502, resp_headers=None, error=str(e))
         return JSONResponse({"error": {"type": "proxy_error", "message": str(e)}}, status_code=502)
 
     status = upstream.status_code
@@ -394,20 +718,31 @@ async def _stream_forward(url: str, headers: dict[str, str], body: bytes, base_l
         finally:
             await cm.__aexit__(None, None, None)
         log.error("%s status=%d upstream-body=%s", base_log, status, err_body[:500])
+        resp_headers = _strip_response_encoding(_filter_headers(dict(upstream.headers)))
+        if recorder:
+            recorder.finish(status=status, resp_headers=resp_headers, resp_body=err_body)
         return Response(
             content=err_body,
             status_code=status,
             media_type=upstream.headers.get("content-type"),
-            headers=_strip_response_encoding(_filter_headers(dict(upstream.headers))),
+            headers=resp_headers,
         )
 
+    captured_chunks: list[bytes] = []
+    captured_bytes = 0
+
     async def iterator():
+        nonlocal captured_bytes
         # Buffer partial SSE lines across chunks. The `message_delta` event carrying
         # final usage is short and often arrives split at byte boundaries.
         sse_buf = ""
+        stream_error: str | None = None
         try:
             async for chunk in upstream.aiter_raw():
                 yield chunk
+                if recorder and captured_bytes < TRAFFIC_MAX_BODY_BYTES:
+                    captured_chunks.append(chunk)
+                    captured_bytes += len(chunk)
                 try:
                     sse_buf += chunk.decode("utf-8", errors="ignore")
                     while "\n" in sse_buf:
@@ -430,10 +765,20 @@ async def _stream_forward(url: str, headers: dict[str, str], body: bytes, base_l
                 except Exception:  # noqa: BLE001 - scanning is best-effort
                     pass
         except httpx.HTTPError as e:
+            stream_error = str(e)
             log.error("%s stream-error=%s", base_log, e)
         finally:
             await cm.__aexit__(None, None, None)
             log.info("%s stream-complete usage=%s", base_log, captured_usage or None)
+            if recorder:
+                sse_text = b"".join(captured_chunks).decode("utf-8", errors="replace")
+                recorder.finish(
+                    status=status,
+                    resp_headers=_strip_response_encoding(_filter_headers(dict(upstream.headers))),
+                    sse_text=sse_text,
+                    usage=captured_usage or None,
+                    error=stream_error,
+                )
 
     return StreamingResponse(
         iterator(),
@@ -455,12 +800,20 @@ async def _passthrough(request: Request, raw: bytes) -> Response:
     if request.url.query:
         url = f"{url}?{request.url.query}"
     headers = _force_identity_encoding(_filter_headers(dict(request.headers)))
+    recorder = Recorder(
+        method=request.method, path=request.url.path,
+        req_headers=dict(request.headers), req_body=raw,
+        model=None, streaming=False,
+    )
     try:
         resp = await _client.request(request.method, url, headers=headers, content=raw)
     except httpx.HTTPError as e:
         log.error("passthrough %s %s error=%s", request.method, request.url.path, e)
+        recorder.finish(status=502, resp_headers=None, error=str(e))
         return JSONResponse({"error": {"type": "proxy_error", "message": str(e)}}, status_code=502)
     log.info("passthrough %s %s status=%d", request.method, request.url.path, resp.status_code)
+    resp_headers = _strip_response_encoding(_filter_headers(dict(resp.headers)))
+    recorder.finish(status=resp.status_code, resp_headers=resp_headers, resp_body=resp.content)
     return Response(content=resp.content, status_code=resp.status_code,
-                    headers=_strip_response_encoding(_filter_headers(dict(resp.headers))),
+                    headers=resp_headers,
                     media_type=resp.headers.get("content-type"))

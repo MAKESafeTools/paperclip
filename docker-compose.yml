@@ -22,6 +22,8 @@ services:
     build: ./cache-proxy
     container_name: paperclip-cache-proxy
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:8012:8000"
     networks:
       - paperclip-net
     environment:
