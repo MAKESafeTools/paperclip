@@ -35,9 +35,38 @@ services:
       - MIN_SYSTEM_TOKENS=1024
       - LOG_LEVEL=INFO
 
+  viz-sidecar:
+    build: ./viz-sidecar
+    container_name: paperclip-viz-sidecar
+    profiles: ["viz"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8013:8000"
+    networks:
+      - paperclip-net
+    depends_on:
+      cache-proxy:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - CACHE_PROXY_URL=http://cache-proxy:8000
+      - DB_PATH=/data/viz.sqlite
+      - POLL_INTERVAL_SECONDS=1.0
+      - LOG_LEVEL=INFO
+      - PAPERCLIP_BASE_URL=http://paperclip:3100
+      # PAPERCLIP_JWT_SECRET falls back to BETTER_AUTH_SECRET from .env.
+      # PAPERCLIP_COMPANY_ID enables paperclip enrichment — set in shell or .env.
+      - PAPERCLIP_COMPANY_ID
+      - PAPERCLIP_AGENT_ID
+      - PAPERCLIP_JWT_SECRET
+    volumes:
+      - viz-data:/data
+
 networks:
   paperclip-net:
     driver: bridge
 
 volumes:
   paperclip-data:
+  viz-data:
