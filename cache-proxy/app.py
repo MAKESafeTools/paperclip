@@ -5,6 +5,10 @@ cache_control breakpoints on system + tools and the extended-cache-ttl beta head
 Pointed at by the CLI via ANTHROPIC_BASE_URL. Auth headers from the incoming request
 (Authorization / x-api-key / anthropic-auth-token) pass through verbatim so OAuth /
 Max-subscription billing is preserved.
+
+Captured /traffic exchanges include a top-level `session_id` extracted from the
+incoming request (`x-claude-code-session-id` header, with metadata.user_id fallback).
+This is consumed by sibling services like viz-sidecar to group calls by session.
 """
 
 from __future__ import annotations
@@ -297,6 +301,29 @@ def _extract_usage(obj: Any) -> dict[str, Any] | None:
     return None
 
 
+def _extract_session_id(req_headers: dict[str, str], req_body_json: Any) -> str | None:
+    """Pull the Claude Code session identifier out of an incoming request.
+    Tries the dedicated header first, then the metadata.user_id blob the SDK
+    embeds in the body. Returned value is the raw session UUID."""
+    for k, v in req_headers.items():
+        if k.lower() == "x-claude-code-session-id" and isinstance(v, str) and v:
+            return v
+    if isinstance(req_body_json, dict):
+        meta = req_body_json.get("metadata")
+        if isinstance(meta, dict):
+            uid = meta.get("user_id")
+            if isinstance(uid, str):
+                try:
+                    parsed = json.loads(uid)
+                except (json.JSONDecodeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    sid = parsed.get("session_id")
+                    if isinstance(sid, str) and sid:
+                        return sid
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Traffic capture
 # ---------------------------------------------------------------------------
@@ -370,6 +397,9 @@ class Recorder:
         self.req_body_json = _try_parse_json(req_body)
         self.model = model
         self.streaming = streaming
+        # Extract before redaction (the session header is non-secret but lives
+        # alongside auth headers, so easier to grab from the raw bag).
+        self.session_id = _extract_session_id(req_headers, self.req_body_json)
 
     def finish(self, *, status: int | None, resp_headers: dict[str, str] | None,
                resp_body: bytes | None = None, sse_text: str | None = None,
@@ -396,6 +426,7 @@ class Recorder:
             "duration_ms": duration_ms,
             "usage": usage,
             "error": error,
+            "session_id": self.session_id,
             "request": {
                 "headers": self.req_headers,
                 "body_json": self.req_body_json,
@@ -587,6 +618,7 @@ async def traffic_list() -> JSONResponse:
             "status": e["status"],
             "duration_ms": e["duration_ms"],
             "usage": e["usage"],
+            "session_id": e.get("session_id"),
         }
         for e in _exchanges
     ]
