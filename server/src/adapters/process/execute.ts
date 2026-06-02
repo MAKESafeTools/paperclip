@@ -32,6 +32,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const wakeTaskId = readTrimmedString(ctxRecord.taskId) ?? readTrimmedString(ctxRecord.issueId);
   if (wakeTaskId) env.PAPERCLIP_TASK_ID = wakeTaskId;
 
+  // projectId is resolved+canonicalized into the context snapshot by the
+  // heartbeat (upstream #6026). Expose it so process agents can bind to their
+  // project workspace without an inbox-lite roundtrip.
+  const projectId = readTrimmedString(ctxRecord.projectId);
+  if (projectId) env.PAPERCLIP_PROJECT_ID = projectId;
+
   const wakeReason = readTrimmedString(ctxRecord.wakeReason);
   if (wakeReason) env.PAPERCLIP_WAKE_REASON = wakeReason;
 
