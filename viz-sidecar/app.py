@@ -28,6 +28,11 @@ POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "1.0"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 STATIC_DIR = Path(__file__).parent / "static"
 
+# Retention: prune exchanges older than RETENTION_DAYS so the DB stays bounded.
+# 0/negative disables pruning. paperclip_runs/agents are tiny and not pruned.
+RETENTION_DAYS = float(os.environ.get("RETENTION_DAYS", "7"))
+RETENTION_INTERVAL_SECONDS = float(os.environ.get("RETENTION_INTERVAL_SECONDS", "3600"))
+
 # Anthropic public pricing (USD per million tokens) as of late 2025/early 2026.
 # Update as needed; entries are best-effort, used only for a banner estimate.
 MODEL_PRICING: dict[str, dict[str, float]] = {
@@ -116,6 +121,11 @@ def _connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    # Enable incremental auto-vacuum so pruned space can be reclaimed without a
+    # full (locking) VACUUM. Takes effect for a fresh DB immediately; an existing
+    # DB needs a one-time VACUUM to switch modes.
+    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -216,6 +226,7 @@ async def _broadcast(event: str, payload: dict[str, Any]) -> None:
 
 _poll_task: asyncio.Task[None] | None = None
 _paperclip_poll_task: asyncio.Task[None] | None = None
+_retention_task: asyncio.Task[None] | None = None
 _seen_ids: set[str] = set()
 
 PAPERCLIP_POLL_INTERVAL_SECONDS = float(os.environ.get("PAPERCLIP_POLL_INTERVAL_SECONDS", "15.0"))
@@ -516,6 +527,13 @@ def _persist_paperclip_run(run: dict[str, Any]) -> None:
     if not row["id"]:
         return
     with _connect() as conn:
+        # Skip no-op writes: the poll loop re-fetches the same runs every cycle,
+        # so only write when raw_json actually changed. Avoids constant WAL churn.
+        existing = conn.execute(
+            "SELECT raw_json FROM paperclip_runs WHERE id = ?", (row["id"],)
+        ).fetchone()
+        if existing is not None and existing["raw_json"] == row["raw_json"]:
+            return
         conn.execute(
             """
             INSERT OR REPLACE INTO paperclip_runs
@@ -545,6 +563,12 @@ def _persist_paperclip_agent(agent: dict[str, Any]) -> None:
         "raw_json": json.dumps(agent),
     }
     with _connect() as conn:
+        # Skip no-op writes (see _persist_paperclip_run).
+        existing = conn.execute(
+            "SELECT raw_json FROM paperclip_agents WHERE id = ?", (row["id"],)
+        ).fetchone()
+        if existing is not None and existing["raw_json"] == row["raw_json"]:
+            return
         conn.execute(
             """
             INSERT OR REPLACE INTO paperclip_agents
@@ -570,17 +594,17 @@ async def _paperclip_poll_loop() -> None:
                 agents = await client.list_agents()
                 if agents:
                     for a in agents:
-                        _persist_paperclip_agent(a)
+                        await asyncio.to_thread(_persist_paperclip_agent, a)
                 runs = await client.list_heartbeat_runs(limit=500)
                 if runs:
                     for r in runs:
-                        _persist_paperclip_run(r)
+                        await asyncio.to_thread(_persist_paperclip_run, r)
                 # live-runs include ones currently in flight; sometimes they overlap
                 # with heartbeat-runs but cheap to also persist for freshness.
                 live = await client.list_live_runs(limit=50)
                 if live:
                     for r in live:
-                        _persist_paperclip_run(r)
+                        await asyncio.to_thread(_persist_paperclip_run, r)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -590,14 +614,58 @@ async def _paperclip_poll_loop() -> None:
         await client.aclose()
 
 
+def _prune_old_exchanges() -> int:
+    """Delete exchanges older than RETENTION_DAYS. Returns rows deleted.
+    Runs in a thread (see _retention_loop) so the big DELETE never blocks the
+    event loop. Also drops the pruned ids from _seen_ids so memory stays bounded."""
+    if RETENTION_DAYS <= 0:
+        return 0
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).isoformat()
+    with _connect() as conn:
+        doomed = [r["id"] for r in conn.execute(
+            "SELECT id FROM exchanges WHERE ts < ?", (cutoff,)
+        )]
+        if not doomed:
+            return 0
+        conn.execute("DELETE FROM exchanges WHERE ts < ?", (cutoff,))
+        # Reclaim freelist space incrementally; full VACUUM would lock the DB.
+        conn.execute("PRAGMA incremental_vacuum")
+    for ex_id in doomed:
+        _seen_ids.discard(ex_id)
+    return len(doomed)
+
+
+async def _retention_loop() -> None:
+    """Periodically prune old exchanges so the DB stays bounded."""
+    if RETENTION_DAYS <= 0:
+        log.info("retention disabled (RETENTION_DAYS<=0)")
+        return
+    log.info(
+        "retention loop starting keep=%.1fd interval=%.0fs",
+        RETENTION_DAYS, RETENTION_INTERVAL_SECONDS,
+    )
+    while True:
+        try:
+            deleted = await asyncio.to_thread(_prune_old_exchanges)
+            if deleted:
+                log.info("retention pruned %d exchanges older than %.1fd", deleted, RETENTION_DAYS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("retention error: %s", e)
+        await asyncio.sleep(RETENTION_INTERVAL_SECONDS)
+
+
 async def _poll_loop() -> None:
     """Poll cache-proxy /traffic/exchanges, persist new records, broadcast via SSE."""
     log.info("poll loop starting target=%s interval=%.2fs", CACHE_PROXY_URL, POLL_INTERVAL_SECONDS)
     # Hydrate _seen_ids from disk so a restart doesn't replay everything currently
-    # still in the cache-proxy ring buffer.
-    with _connect() as conn:
-        for row in conn.execute("SELECT id FROM exchanges"):
-            _seen_ids.add(row["id"])
+    # still in the cache-proxy ring buffer. Full-table scan → run off the loop.
+    def _hydrate() -> set[str]:
+        with _connect() as conn:
+            return {row["id"] for row in conn.execute("SELECT id FROM exchanges")}
+    _seen_ids.update(await asyncio.to_thread(_hydrate))
     log.info("hydrated seen_ids count=%d from sqlite", len(_seen_ids))
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0)) as client:
@@ -619,7 +687,7 @@ async def _poll_loop() -> None:
                     except Exception as e:
                         log.warning("failed to fetch detail for %s: %s", ex_id, e)
                         continue
-                    row = _persist(record)
+                    row = await asyncio.to_thread(_persist, record)
                     _seen_ids.add(ex_id)
                     await _broadcast("exchange", _summary_from_row(row))
             except httpx.HTTPError as e:
@@ -692,14 +760,15 @@ async def _startup() -> None:
     tok, sid, blk, sums = _backfill_derived_columns()
     if tok or sid or blk or sums:
         log.info("backfilled rows: tokens=%d session_id=%d blocks=%d summaries=%d", tok, sid, blk, sums)
-    global _poll_task, _paperclip_poll_task
+    global _poll_task, _paperclip_poll_task, _retention_task
     _poll_task = asyncio.create_task(_poll_loop())
     _paperclip_poll_task = asyncio.create_task(_paperclip_poll_loop())
+    _retention_task = asyncio.create_task(_retention_loop())
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    for t in (_poll_task, _paperclip_poll_task):
+    for t in (_poll_task, _paperclip_poll_task, _retention_task):
         if t is not None:
             t.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -759,38 +828,56 @@ async def list_exchanges(
 ) -> JSONResponse:
     limit = max(1, min(limit, 1000))
     since = _since_iso(range)
-    clauses: list[str] = []
-    params: list[Any] = []
-    if before_ts:
-        clauses.append("ts < ?")
-        params.append(before_ts)
-    if session_id:
-        clauses.append("session_id = ?")
-        params.append(session_id)
-    if since:
-        clauses.append("ts >= ?")
-        params.append(since)
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
     # context_delta = (this row's input context) - (prior row's input context in
-    # the same session). Computed via LAG() in a CTE over the *full* exchanges
-    # table so the delta is right even when WHERE filters hide the predecessor.
-    # NULL prior → NULL delta (rendered as "—" client-side).
+    # the same session), via LAG(). The window must be computed BEFORE the outer
+    # ORDER BY/LIMIT, but scoping the inner scan to the time range / session keeps
+    # it from re-reading the entire (multi-GB) table on every poll. The first row
+    # in a window gets a NULL prior → NULL delta (rendered as "—" client-side).
+    inner_clauses: list[str] = []
+    inner_params: list[Any] = []
+    if session_id:
+        inner_clauses.append("session_id = ?")
+        inner_params.append(session_id)
+    if since:
+        inner_clauses.append("ts >= ?")
+        inner_params.append(since)
+    inner_where = ("WHERE " + " AND ".join(inner_clauses)) if inner_clauses else ""
+
+    outer_clauses: list[str] = []
+    outer_params: list[Any] = []
+    if before_ts:
+        outer_clauses.append("ts < ?")
+        outer_params.append(before_ts)
+    outer_where = ("WHERE " + " AND ".join(outer_clauses)) if outer_clauses else ""
+
+    # Select only the columns _summary_from_row needs — crucially NOT detail_json,
+    # which is a large (~hundreds of KB) blob per row. Pulling it through the
+    # window function was dragging hundreds of MB through the CTE on every call.
+    _COLS = ("id, ts, method, path, model, streaming, status, duration_ms, "
+             "input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, "
+             "error, session_id, req_block_types, resp_block_types, req_summary, resp_summary")
     sql = f"""
         WITH with_delta AS (
-            SELECT *,
+            SELECT {_COLS},
                    (COALESCE(input_tokens,0) + COALESCE(cache_read_tokens,0) + COALESCE(cache_creation_tokens,0))
                    - LAG(COALESCE(input_tokens,0) + COALESCE(cache_read_tokens,0) + COALESCE(cache_creation_tokens,0))
                        OVER (PARTITION BY session_id ORDER BY ts)
                    AS context_delta
               FROM exchanges
+              {inner_where}
         )
         SELECT * FROM with_delta
-        {where}
+        {outer_where}
         ORDER BY ts DESC LIMIT ?
     """
-    params.append(limit)
-    with _connect() as conn:
-        rows = [_summary_from_row(r) for r in conn.execute(sql, params).fetchall()]
+    params = [*inner_params, *outer_params, limit]
+
+    def _run() -> list[dict[str, Any]]:
+        with _connect() as conn:
+            return [_summary_from_row(r) for r in conn.execute(sql, params).fetchall()]
+
+    rows = await asyncio.to_thread(_run)
     return JSONResponse({"count": len(rows), "exchanges": rows})
 
 
@@ -825,9 +912,11 @@ async def list_sessions(range: str | None = None, limit: int = 200) -> JSONRespo
     params.append(limit)
 
     now = datetime.now(timezone.utc)
-    sessions: list[dict[str, Any]] = []
-    total_cost = 0.0
-    with _connect() as conn:
+
+    def _run() -> tuple[list[dict[str, Any]], float]:
+      sessions: list[dict[str, Any]] = []
+      total_cost = 0.0
+      with _connect() as conn:
         rows = conn.execute(sql, params).fetchall()
         for r in rows:
             row = dict(r)
@@ -906,6 +995,9 @@ async def list_sessions(range: str | None = None, limit: int = 200) -> JSONRespo
                 "prompt_preview": preview,
                 "paperclip": paperclip_info,
             })
+      return sessions, total_cost
+
+    sessions, total_cost = await asyncio.to_thread(_run)
     active_count = sum(1 for s in sessions if s["active"])
     return JSONResponse({
         "count": len(sessions),
@@ -917,10 +1009,13 @@ async def list_sessions(range: str | None = None, limit: int = 200) -> JSONRespo
 
 @app.get("/api/exchanges/{ex_id}")
 async def get_exchange(ex_id: str) -> JSONResponse:
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT detail_json FROM exchanges WHERE id = ?", (ex_id,)
-        ).fetchone()
+    def _run() -> sqlite3.Row | None:
+        with _connect() as conn:
+            return conn.execute(
+                "SELECT detail_json FROM exchanges WHERE id = ?", (ex_id,)
+            ).fetchone()
+
+    row = await asyncio.to_thread(_run)
     if row is None:
         raise HTTPException(status_code=404, detail="not found")
     return JSONResponse(json.loads(row["detail_json"]))
@@ -941,24 +1036,29 @@ async def stats(range: str | None = None) -> JSONResponse:
     since = _since_iso(range)
     where = "WHERE ts >= ?" if since else ""
     params: list[Any] = [since] if since else []
-    with _connect() as conn:
-        rows = conn.execute(
-            f"""
-            SELECT model,
-                   COUNT(*) AS n,
-                   COALESCE(SUM(input_tokens),0) AS input_tokens,
-                   COALESCE(SUM(output_tokens),0) AS output_tokens,
-                   COALESCE(SUM(cache_read_tokens),0) AS cache_read_tokens,
-                   COALESCE(SUM(cache_creation_tokens),0) AS cache_creation_tokens
-              FROM exchanges
-              {where}
-             GROUP BY model
-            """,
-            params,
-        ).fetchall()
-        total_row = conn.execute(
-            f"SELECT COUNT(*) AS n FROM exchanges {where}", params
-        ).fetchone()
+
+    def _run() -> tuple[list[sqlite3.Row], sqlite3.Row]:
+        with _connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT model,
+                       COUNT(*) AS n,
+                       COALESCE(SUM(input_tokens),0) AS input_tokens,
+                       COALESCE(SUM(output_tokens),0) AS output_tokens,
+                       COALESCE(SUM(cache_read_tokens),0) AS cache_read_tokens,
+                       COALESCE(SUM(cache_creation_tokens),0) AS cache_creation_tokens
+                  FROM exchanges
+                  {where}
+                 GROUP BY model
+                """,
+                params,
+            ).fetchall()
+            total_row = conn.execute(
+                f"SELECT COUNT(*) AS n FROM exchanges {where}", params
+            ).fetchone()
+        return rows, total_row
+
+    rows, total_row = await asyncio.to_thread(_run)
 
     by_model: list[dict[str, Any]] = []
     total_cost = 0.0

@@ -54,6 +54,9 @@ services:
       - DB_PATH=/data/viz.sqlite
       - POLL_INTERVAL_SECONDS=1.0
       - LOG_LEVEL=INFO
+      # Prune exchanges older than RETENTION_DAYS to keep the SQLite DB bounded.
+      - RETENTION_DAYS=7
+      - RETENTION_INTERVAL_SECONDS=3600
       - PAPERCLIP_BASE_URL=http://paperclip:3100
       # PAPERCLIP_JWT_SECRET falls back to BETTER_AUTH_SECRET from .env.
       # PAPERCLIP_COMPANY_ID enables paperclip enrichment — set in shell or .env.
