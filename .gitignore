@@ -5,7 +5,10 @@ node_modules/
 dist/
 ui/storybook-static/
 .env
+.env.*
+!.env.example
 *.tsbuildinfo
+__pycache__/
 drizzle/meta/
 .vite/
 coverage/
