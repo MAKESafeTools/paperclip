@@ -14,9 +14,34 @@ services:
     depends_on:
       cache-proxy:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     volumes:
       - paperclip-data:/paperclip
       - /home/scott/.paperclip/mcp-configs:/home/scott/.paperclip/mcp-configs:ro
+
+  postgres:
+    image: postgres:18
+    container_name: paperclip-postgres
+    restart: unless-stopped
+    # Bind to loopback only — paperclip reaches it over the compose network.
+    ports:
+      - "127.0.0.1:5433:5432"
+    networks:
+      - paperclip-net
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-paperclip}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-paperclip}
+      - POSTGRES_DB=${POSTGRES_DB:-paperclip}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-paperclip} -d ${POSTGRES_DB:-paperclip}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    volumes:
+      # postgres:18 stores data in a major-version subdir under this mount.
+      - pg-data:/var/lib/postgresql
 
   cache-proxy:
     build: ./cache-proxy
@@ -73,3 +98,4 @@ networks:
 volumes:
   paperclip-data:
   viz-data:
+  pg-data:
